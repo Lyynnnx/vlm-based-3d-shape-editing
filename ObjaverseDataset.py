@@ -5,7 +5,7 @@ import trimesh
 import os
 
 class ObjaverseDataset(Dataset):
-    def __init__(self, uids: list = None, category: str = None, limit: int = 20):
+    def __init__(self, uids: list = None, category: str = None, start_index: int = 0, limit: int = 20):
         """
         Dataset to load from objaverse dataset
         :param uids: ids of samples
@@ -20,11 +20,11 @@ class ObjaverseDataset(Dataset):
             lvis_annotations = objaverse.load_lvis_annotations()
             # either take from specified category
             if category and category in lvis_annotations:
-                self.uids = lvis_annotations[category][:limit]
+                self.uids = lvis_annotations[category][start_index:limit]
             # or take first limit samples
             else:
                 all_ids = objaverse.load_uids()
-                self.uids = all_ids[:limit]
+                self.uids = all_ids[start_index:limit]
         # load paths for objects
         self.object_paths = objaverse.load_objects(uids=self.uids)
         # again extract ids from objects to protect against false uids from user
