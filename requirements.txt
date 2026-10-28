@@ -1,3 +1,4 @@
 objaverse
 trimesh
 pyrender
+open3d
