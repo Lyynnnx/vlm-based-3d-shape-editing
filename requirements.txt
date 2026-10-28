@@ -1,4 +1,5 @@
 objaverse
 trimesh
+pythreejs
 pyrender
 open3d
