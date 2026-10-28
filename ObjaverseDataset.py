@@ -18,8 +18,10 @@ class ObjaverseDataset(Dataset):
         # if ids are not provided
         if uids is None:
             lvis_annotations = objaverse.load_lvis_annotations()
+            print(lvis_annotations.keys())
             # either take from specified category
             if category and category in lvis_annotations:
+
                 self.uids = lvis_annotations[category][start_index:limit]
             # or take first limit samples
             else:
