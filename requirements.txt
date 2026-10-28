@@ -3,3 +3,5 @@ trimesh
 pythreejs
 pyrender
 open3d
+PIL
+pyglet<2
