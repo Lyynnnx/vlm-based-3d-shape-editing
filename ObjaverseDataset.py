@@ -62,5 +62,14 @@ class ObjaverseDataset(Dataset):
             "faces": torch.tensor(mesh.faces, dtype=torch.long)
         }
 
+    def collate_fn(self, batch):
+        return {
+            "uid": [item["uid"] for item in batch],
+            "mesh": [item["mesh"] for item in batch],  # Mesh list
+            "obj_path": [item["obj_path"] for item in batch],
+            "vertices": [item["vertices"] for item in batch],
+            "faces": [item["faces"] for item in batch]
+        }
+
 
 
