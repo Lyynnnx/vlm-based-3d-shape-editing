@@ -4,3 +4,7 @@ pythreejs
 opencv-python
 numpy<2
 git+https://github.com/facebookresearch/segment-anything.git
+pyrender
+open3d
+PIL
+pyglet<2
