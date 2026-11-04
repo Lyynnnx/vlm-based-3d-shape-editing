@@ -203,14 +203,7 @@ def generate_bounding_box_for_image(ollama_host, image_path, user_prompt, model_
         options={'temperature': temperature}
     )
     content = response['message']['content']
-    data = json.loads(content)
-    four_coordinates = data['bbox_2d']
-    print(four_coordinates)
-    x1 = four_coordinates[0]
-    y1 = four_coordinates[1]
-    x2 = four_coordinates[2]
-    y2 = four_coordinates[3]
-    return [x1, y1, x2, y2]
+    return content
 
 
 
