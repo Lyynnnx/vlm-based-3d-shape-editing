@@ -75,49 +75,51 @@ def _convert_trimesh_to_o3d(tmesh):
     o3d_mesh.compute_vertex_normals()
     return o3d_mesh
 
-def render_6_views(mesh_input, output_dir="rendered_views", width=1008, height=1008, camera_distance_multiplyer = 2.2):
+
+def render_6_views(mesh_input, output_dir="rendered_views", width=1008, height=1008, views=None):
     """
-    Render mesh from 6 views (front, back, left, right, top, bottom)
-    :param mesh_input: path to the .obj mesh / trimesh / open3d
-    :param output_dir: output directory
-    :param width: render width
-    :param height: render height
-    :param camera_distance_multiplyer: coefitient that determines the distance between camera and object
-    :return:
+    Generates images for specified viewpoints and returns a list of tuples formatted as [(eye_pos, file_path), ...].
+
+    Parameters:
+        - mesh_input: file path (.obj), trimesh.Trimesh, trimesh.Scene, or o3d.geometry.TriangleMesh
+        - output_dir: directory to save rendered frames
+        - width, height: resolution of output images
+        - views: dict of viewpoints formatted as {"name": (eye_np_array, up_np_array)}.
+                 If None, standard 6 views will be calculated automatically.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Convert mesh to o3d mesh
+    # Convert input object to Open3D TriangleMesh
     if isinstance(mesh_input, str):
         mesh = o3d.io.read_triangle_mesh(mesh_input)
     elif isinstance(mesh_input, trimesh.Trimesh):
-        mesh = _convert_trimesh_to_o3d(mesh_input)
+        mesh = convert_trimesh_to_o3d(mesh_input)
     elif isinstance(mesh_input, trimesh.Scene):
         tmesh = mesh_input.dump(concatenate=True)
-        mesh = _convert_trimesh_to_o3d(tmesh)
+        mesh = convert_trimesh_to_o3d(tmesh)
     else:
         mesh = mesh_input
 
     mesh.compute_vertex_normals()
 
-    # Calculate center and camera distance
+    # Automatically calculate center and camera offset distance
     bbox = mesh.get_axis_aligned_bounding_box()
     center = bbox.get_center()
     extent = bbox.get_max_extent()
-    dist = extent * camera_distance_multiplyer  # Camera distance
+    dist = extent * 2.2  # Camera offset distance
 
-    # Define 6 views
-    views = {
-        "front":  (center + np.array([0, 0, dist]),   np.array([0, 1, 0])),
-        "back":   (center + np.array([0, 0, -dist]),  np.array([0, 1, 0])),
-        "left":   (center + np.array([-dist, 0, 0]),  np.array([0, 1, 0])),
-        "right":  (center + np.array([dist, 0, 0]),   np.array([0, 1, 0])),
-        "top":    (center + np.array([0, dist, 0]),   np.array([0, 0, -1])),
-        "bottom": (center + np.array([0, -dist, 0]),  np.array([0, 0, 1]))
-    }
+    # Generate standard 6 viewpoints if custom views are not provided
+    if views is None:
+        views = {
+            "front": (center + np.array([0, 0, dist]), np.array([0, 1, 0])),
+            "back": (center + np.array([0, 0, -dist]), np.array([0, 1, 0])),
+            "left": (center + np.array([-dist, 0, 0]), np.array([0, 1, 0])),
+            "right": (center + np.array([dist, 0, 0]), np.array([0, 1, 0])),
+            "top": (center + np.array([0, dist, 0]), np.array([0, 0, -1])),
+            "bottom": (center + np.array([0, -dist, 0]), np.array([0, 0, 1]))
+        }
 
-    # Open3d configuration
-
+    # Setup Open3D offscreen renderer
     renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
     material = o3d.visualization.rendering.MaterialRecord()
     material.shader = "defaultLit"
@@ -125,27 +127,34 @@ def render_6_views(mesh_input, output_dir="rendered_views", width=1008, height=1
     renderer.scene.add_geometry("mesh", mesh, material)
     renderer.scene.set_background(np.array([0.2, 0.2, 0.2, 1.0]))
 
-    # Calculate camera boundaries without image extensions
-    half_size = (extent / 2.0) * 1.2  # 1.2 дает 20% свободного места по краям
-    aspect = width / height           # Учитываем пропорции картинки (чтобы не сплющило)
+    half_size = (extent / 2.0) * 1.2
+    aspect = width / height
+
+    rendered_results = []
 
     for name, (eye, up) in views.items():
-        # Set the camera
+        # 1. Point the camera
         renderer.scene.camera.look_at(center, eye, up)
-        # Enable orthographic camera projection to disable perspective and distorion
+
+        # 2. Set orthographic projection
         renderer.scene.camera.set_projection(
             o3d.visualization.rendering.Camera.Projection.Ortho,
-            -half_size * aspect, half_size * aspect,  # left, right
-            -half_size, half_size,                    # bottom, top
-            0.1, dist * 5.0                           # near, far
+            -half_size * aspect, half_size * aspect,
+            -half_size, half_size,
+            0.1, dist * 5.0
         )
 
-        # Render images and store
+        # Render and save image
         img = renderer.render_to_image()
         file_path = os.path.join(output_dir, f"{name}.png")
         o3d.io.write_image(file_path, img)
 
-    del renderer
+        # Append tuple (camera_position, file_path) to results
+        rendered_results.append((eye, file_path))
+
+    del renderer  # Free resources
+
+    return rendered_results
 
 def show_rendered_grid(input_dir="rendered_views"):
     """
@@ -270,87 +279,115 @@ import numpy as np
 from PIL import Image
 import trimesh.visual
 
+import numpy as np
+import trimesh
+from PIL import Image
 
-def project_masks_to_3d(mesh, masks_dict, width=800, height=800):
+def project_masks_to_3d(mesh, masks_data, width=1008, height=1008):
     """
-    Projects 2D segmentation masks onto a 3D mesh using back-projection.
+    Projects 2D masks onto a 3D trimesh model using camera parameters.
 
-    :param mesh: trimesh.Trimesh or Open3D TriangleMesh object
-    :param masks_dict: Dictionary mapping view names to masks, e.g., {'front': mask_array, ...}
-    :param width: Image width used during rendering
-    :param height: Image height used during rendering
-    :return: (colored_mesh, mask_submesh)
+    Parameters:
+        mesh: trimesh.Trimesh object
+        masks_data: list or dict containing mask and camera positions.
+            Supported formats:
+            - List of tuples: [(mask, eye), ...] or [(mask, eye, up), ...]
+            - Dict: {name: (mask, eye), ...} or {name: (mask, eye, up), ...}
+            - Dict of dicts: {name: {"mask": mask, "eye": eye, "up": up}, ...}
+        width, height: Resolution of the rendered views (matching mask dimensions)
+
+    Returns:
+        colored_mesh: trimesh.Trimesh with green highlighted masked vertices
+        mask_submesh: trimesh.Trimesh submesh of the masked region
     """
     vertices = mesh.vertices
     normals = mesh.vertex_normals
 
-    # Universal center and extent extraction for both Open3D and Trimesh
-    if hasattr(mesh, 'get_axis_aligned_bounding_box'):
-        bbox = mesh.get_axis_aligned_bounding_box()
-        center = bbox.get_center()
-        extent = bbox.get_max_extent()
-    else:
-        # For trimesh.Trimesh
-        center = mesh.bounds.mean(axis=0)     # AABB center
-        extent = float(mesh.extents.max())    # AABB max extent
+    # Calculate bounding box parameters natively in Trimesh
+    bounds = mesh.bounds
+    center = bounds.mean(axis=0)
+    extent = mesh.extents.max()
 
-    dist = extent * 2.2
     half_size = (extent / 2.0) * 1.2
     aspect = width / height
-
-    # Define camera origins and up-vectors for 6 orthogonal views
-    views = {
-        "front":  (center + np.array([0, 0, dist]),   np.array([0, 1, 0])),
-        "back":   (center + np.array([0, 0, -dist]),  np.array([0, 1, 0])),
-        "left":   (center + np.array([-dist, 0, 0]),  np.array([0, 1, 0])),
-        "right":  (center + np.array([dist, 0, 0]),   np.array([0, 1, 0])),
-        "top":    (center + np.array([0, dist, 0]),   np.array([0, 0, -1])),
-        "bottom": (center + np.array([0, -dist, 0]),  np.array([0, 0, 1]))
-    }
 
     vertex_masked = np.zeros(len(vertices), dtype=bool)
     rel_verts = vertices - center
 
-    for name, (eye, up) in views.items():
-        if name not in masks_dict:
-            continue
+    # Unify masks_data into a list of tuples: (mask, eye, up)
+    items = []
+    if isinstance(masks_data, dict):
+        for val in masks_data.values():
+            if isinstance(val, dict):
+                mask = val["mask"]
+                eye = np.array(val["eye"], dtype=float)
+                up = np.array(val["up"], dtype=float) if "up" in val and val["up"] is not None else None
+            elif isinstance(val, (tuple, list)):
+                mask = val[0]
+                eye = np.array(val[1], dtype=float)
+                up = np.array(val[2], dtype=float) if len(val) > 2 else None
+            items.append((mask, eye, up))
+    elif isinstance(masks_data, (list, tuple)):
+        for val in masks_data:
+            if isinstance(val, dict):
+                mask = val["mask"]
+                eye = np.array(val["eye"], dtype=float)
+                up = np.array(val["up"], dtype=float) if "up" in val and val["up"] is not None else None
+            elif isinstance(val, (tuple, list)):
+                mask = val[0]
+                eye = np.array(val[1], dtype=float)
+                up = np.array(val[2], dtype=float) if len(val) > 2 else None
+            items.append((mask, eye, up))
 
-        mask_img = masks_dict[name]
+    for mask_img, eye, up in items:
+        # Convert mask to boolean numpy array
         if isinstance(mask_img, Image.Image):
             mask_arr = np.array(mask_img) > 128
         else:
             mask_arr = mask_img > 0
 
-        # Construct camera coordinate basis
+        # Camera orientation basis
         z_cam = (eye - center) / np.linalg.norm(eye - center)
+
+        # Auto-detect 'up' vector if missing
+        if up is None:
+            if np.abs(z_cam[1]) > 0.99:  # Top or Bottom view
+                up = np.array([0.0, 0.0, -1.0]) if z_cam[1] > 0 else np.array([0.0, 0.0, 1.0])
+            else:
+                up = np.array([0.0, 1.0, 0.0])
+
         x_cam = np.cross(up, z_cam)
         x_cam /= np.linalg.norm(x_cam)
         y_cam = np.cross(z_cam, x_cam)
         y_cam /= np.linalg.norm(y_cam)
 
-        # 1. Back-face culling (verify normal orientation relative to the camera)
+        # 1. Back-face culling
         visible_mask = np.dot(normals, z_cam) > 0.1
 
-        # 2. Project 3D vertices to 2D pixel coordinates
+        # 2. Project 3D coordinates to NDC
         x_proj = np.dot(rel_verts, x_cam)
         y_proj = np.dot(rel_verts, y_cam)
 
         u_ndc = x_proj / (half_size * aspect)
         v_ndc = y_proj / half_size
 
+        # Convert NDC to pixel indices
         px = np.clip(np.round((u_ndc + 1.0) / 2.0 * (width - 1)).astype(int), 0, width - 1)
         py = np.clip(np.round((1.0 - v_ndc) / 2.0 * (height - 1)).astype(int), 0, height - 1)
 
-        # 3. Sample mask at projected pixel locations
+        # 3. Sample mask
         sampled_mask = mask_arr[py, px]
+
+        # Accumulate mask flags
         vertex_masked |= (visible_mask & sampled_mask)
 
-    # --- 3D Model Coloring ---
+    # --- Color 3D Mesh ---
     colored_mesh = mesh.copy()
     colors = np.full((len(vertices), 4), [180, 180, 180, 255], dtype=np.uint8)
-    colors[vertex_masked] = [0, 255, 0, 255]  # Green for masked vertices
+    colors[vertex_masked] = [0, 255, 0, 255]
+    colored_mesh.visual.vertex_colors = colors
 
-    # --- Extract Masked 3D Submesh ---
+    # --- Extract Mask Submesh ---
     masked_faces = vertex_masked[mesh.faces].any(axis=1)
     mask_submesh = mesh.submesh([masked_faces], append=True)
 
