@@ -75,7 +75,7 @@ def _convert_trimesh_to_o3d(tmesh):
     o3d_mesh.compute_vertex_normals()
     return o3d_mesh
 
-def render_6_views(mesh_input, output_dir="rendered_views", width=800, height=800, camera_distance_multiplyer = 2.2):
+def render_6_views(mesh_input, output_dir="rendered_views", width=1008, height=1008, camera_distance_multiplyer = 2.2):
     """
     Render mesh from 6 views (front, back, left, right, top, bottom)
     :param mesh_input: path to the .obj mesh / trimesh / open3d
@@ -264,3 +264,94 @@ def visualize_segmentation(image_path: str, mask, x1, y1, x2, y2):
     plt.title("Output of SAM including bounding box")
     plt.axis('off')
     plt.show()
+
+
+import numpy as np
+from PIL import Image
+import trimesh.visual
+
+
+def project_masks_to_3d(mesh, masks_dict, width=800, height=800):
+    """
+    Projects 2D segmentation masks onto a 3D mesh using back-projection.
+
+    :param mesh: trimesh.Trimesh or Open3D TriangleMesh object
+    :param masks_dict: Dictionary mapping view names to masks, e.g., {'front': mask_array, ...}
+    :param width: Image width used during rendering
+    :param height: Image height used during rendering
+    :return: (colored_mesh, mask_submesh)
+    """
+    vertices = mesh.vertices
+    normals = mesh.vertex_normals
+
+    # Universal center and extent extraction for both Open3D and Trimesh
+    if hasattr(mesh, 'get_axis_aligned_bounding_box'):
+        bbox = mesh.get_axis_aligned_bounding_box()
+        center = bbox.get_center()
+        extent = bbox.get_max_extent()
+    else:
+        # For trimesh.Trimesh
+        center = mesh.bounds.mean(axis=0)     # AABB center
+        extent = float(mesh.extents.max())    # AABB max extent
+
+    dist = extent * 2.2
+    half_size = (extent / 2.0) * 1.2
+    aspect = width / height
+
+    # Define camera origins and up-vectors for 6 orthogonal views
+    views = {
+        "front":  (center + np.array([0, 0, dist]),   np.array([0, 1, 0])),
+        "back":   (center + np.array([0, 0, -dist]),  np.array([0, 1, 0])),
+        "left":   (center + np.array([-dist, 0, 0]),  np.array([0, 1, 0])),
+        "right":  (center + np.array([dist, 0, 0]),   np.array([0, 1, 0])),
+        "top":    (center + np.array([0, dist, 0]),   np.array([0, 0, -1])),
+        "bottom": (center + np.array([0, -dist, 0]),  np.array([0, 0, 1]))
+    }
+
+    vertex_masked = np.zeros(len(vertices), dtype=bool)
+    rel_verts = vertices - center
+
+    for name, (eye, up) in views.items():
+        if name not in masks_dict:
+            continue
+
+        mask_img = masks_dict[name]
+        if isinstance(mask_img, Image.Image):
+            mask_arr = np.array(mask_img) > 128
+        else:
+            mask_arr = mask_img > 0
+
+        # Construct camera coordinate basis
+        z_cam = (eye - center) / np.linalg.norm(eye - center)
+        x_cam = np.cross(up, z_cam)
+        x_cam /= np.linalg.norm(x_cam)
+        y_cam = np.cross(z_cam, x_cam)
+        y_cam /= np.linalg.norm(y_cam)
+
+        # 1. Back-face culling (verify normal orientation relative to the camera)
+        visible_mask = np.dot(normals, z_cam) > 0.1
+
+        # 2. Project 3D vertices to 2D pixel coordinates
+        x_proj = np.dot(rel_verts, x_cam)
+        y_proj = np.dot(rel_verts, y_cam)
+
+        u_ndc = x_proj / (half_size * aspect)
+        v_ndc = y_proj / half_size
+
+        px = np.clip(np.round((u_ndc + 1.0) / 2.0 * (width - 1)).astype(int), 0, width - 1)
+        py = np.clip(np.round((1.0 - v_ndc) / 2.0 * (height - 1)).astype(int), 0, height - 1)
+
+        # 3. Sample mask at projected pixel locations
+        sampled_mask = mask_arr[py, px]
+        vertex_masked |= (visible_mask & sampled_mask)
+
+    # --- 3D Model Coloring ---
+    colored_mesh = mesh.copy()
+    colors = np.full((len(vertices), 4), [180, 180, 180, 255], dtype=np.uint8)
+    colors[vertex_masked] = [0, 255, 0, 255]  # Green for masked vertices
+
+    # --- Extract Masked 3D Submesh ---
+    masked_faces = vertex_masked[mesh.faces].any(axis=1)
+    mask_submesh = mesh.submesh([masked_faces], append=True)
+
+    return colored_mesh, mask_submesh
