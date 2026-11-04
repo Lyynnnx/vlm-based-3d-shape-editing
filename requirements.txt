@@ -7,3 +7,4 @@ git+https://github.com/facebookresearch/segment-anything.git
 pyrender
 open3d
 pyglet<2
+ollama

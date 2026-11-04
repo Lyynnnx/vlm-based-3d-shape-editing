@@ -8,6 +8,9 @@ import open3d as o3d
 import trimesh
 import matplotlib.pyplot as plt
 from PIL import Image
+import ollama
+from prompts import BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT
+import json
 
 # =============================================================================
 # 3D to multi-view 2D
@@ -178,6 +181,42 @@ def show_rendered_grid(input_dir="rendered_views"):
     plt.show()
 
 # ==============================================================================
+# VLM-based bounding box generation
+# ==============================================================================
+def generate_bounding_box_for_image(ollama_host, image_path, user_prompt, model_name = "qwen2.5vl:7b", temperature = 0.1):
+    """
+    Generates the upper left and bottom right coordinates of bounding box for requested by user object on given image
+    :param ollama_host: ip address of ollama
+    :param image_path: path to the image. Note: image size should be multiple of 28
+    :param user_prompt: object that should be bounded
+    :param model_name: name of the vlm model, qwen2.5vl:7b by default
+    :param temperature: temperature for vlm predictions
+    :return: array of 4 numbers [x1, y1, x2, y2], where x1, y1 - top left coordinate of bounding box and x2, y2 - bottom right coordinate of bounding box
+    """
+    client = ollama.Client(host=ollama_host)
+    system_prompt = (BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT)
+    response = client.chat(
+        model=model_name,
+        messages = [
+            {
+                'role': 'system',
+                'content': system_prompt,
+            },
+            {
+                'role': 'user',
+                'content': f"{user_prompt}",
+                'images': [image_path]
+            }
+        ],
+        format='json',
+        options={'temperature': temperature}
+    )
+    content = response['message']['content']
+    return content
+
+
+
+# ==============================================================================
 # Image Segmentation
 # ==============================================================================
 def download_SAM_weights() -> str:
@@ -257,14 +296,16 @@ def visualize_segmentation(image_path: str, mask, x1, y1, x2, y2):
     :return:
     """
     image = cv2.imread(image_path)
+    print("Image size (H, W, C):", image.shape)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     plt.figure(figsize=(10, 10))
     plt.imshow(image)  # original image
 
     # apply the mask
-    overlay = np.zeros((*mask.shape, 4), dtype=np.float32)
-    overlay[mask] = [1.0, 0.0, 0.0, 0.5]  # Color of the mask
-    plt.imshow(overlay)
+    if mask is not None:
+        overlay = np.zeros((*mask.shape, 4), dtype=np.float32)
+        overlay[mask] = [1.0, 0.0, 0.0, 0.5]  # Color of the mask
+        plt.imshow(overlay)
 
     # Show bounding box
     plt.gca().add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
