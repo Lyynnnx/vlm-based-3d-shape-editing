@@ -461,8 +461,10 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, 
         colored_mesh: trimesh.Trimesh with green highlighted masked vertices
         mask_submesh: trimesh.Trimesh submesh of the masked region
     """
-    vertices = mesh.vertices
-    normals = mesh.vertex_normals
+    # Work on triangles: interpolated vertex colors create a green halo on
+    # neighbouring faces, even when their centres are outside the 2D mask.
+    face_centers = mesh.triangles_center
+    face_normals = mesh.face_normals
 
     bounds = mesh.bounds
     center = bounds.mean(axis=0)
@@ -471,8 +473,16 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, 
     half_size = (extent / 2.0) * 1.2
     aspect = width / height
 
-    vertex_hit_count = np.zeros(len(vertices), dtype=int)
-    rel_verts = vertices - center
+    face_hit_count = np.zeros(len(mesh.faces), dtype=int)
+    face_visible_count = np.zeros(len(mesh.faces), dtype=int)
+    rel_faces = face_centers - center
+
+    ray_mesh = o3d.t.geometry.TriangleMesh(
+        o3d.core.Tensor(np.asarray(mesh.vertices), dtype=o3d.core.Dtype.Float32),
+        o3d.core.Tensor(np.asarray(mesh.faces), dtype=o3d.core.Dtype.UInt32),
+    )
+    ray_scene = o3d.t.geometry.RaycastingScene()
+    ray_scene.add_triangles(ray_mesh)
 
     # Unify masks_data into a list of tuples: (mask, eye, up)
     items = []
@@ -501,10 +511,11 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, 
 
     for mask_img, eye, up in items:
         # Convert mask to boolean numpy array
-        if isinstance(mask_img, Image.Image):
-            mask_arr = np.array(mask_img) > 128
-        else:
-            mask_arr = mask_img > 0
+        mask_arr = np.asarray(mask_img)
+        if mask_arr.ndim == 3:
+            mask_arr = mask_arr[..., 0]
+        mask_arr = mask_arr > 0 if mask_arr.dtype == bool else mask_arr > 128
+        image_height, image_width = mask_arr.shape
 
         # Camera orientation basis
         z_cam = (eye - center) / np.linalg.norm(eye - center)
@@ -522,50 +533,42 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, 
         y_cam /= np.linalg.norm(y_cam)
 
         # 1. Back-face culling (усилен с 0.1 до 0.3)
-        visible_mask = np.dot(normals, z_cam) > normal_thresh
+        visible_mask = np.dot(face_normals, z_cam) > normal_thresh
 
         # 2. Project 3D coordinates to NDC & pixels
-        x_proj = np.dot(rel_verts, x_cam)
-        y_proj = np.dot(rel_verts, y_cam)
+        x_proj = np.dot(rel_faces, x_cam)
+        y_proj = np.dot(rel_faces, y_cam)
 
         u_ndc = x_proj / (half_size * aspect)
         v_ndc = y_proj / half_size
 
-        px = np.clip(np.round((u_ndc + 1.0) / 2.0 * (width - 1)).astype(int), 0, width - 1)
-        py = np.clip(np.round((1.0 - v_ndc) / 2.0 * (height - 1)).astype(int), 0, height - 1)
+        px = np.round((u_ndc + 1.0) / 2.0 * (image_width - 1)).astype(int)
+        py = np.round((1.0 - v_ndc) / 2.0 * (image_height - 1)).astype(int)
+        in_frame = (px >= 0) & (px < image_width) & (py >= 0) & (py < image_height)
+        candidates = np.flatnonzero(visible_mask & in_frame)
+        if len(candidates) == 0:
+            continue
 
-        # 3. Z-Buffer Occlusion Check (ПРОВЕРКА НА ПЕРЕКРЫТИЕ ГЛУБИНЫ)
-        depths = np.dot(rel_verts, z_cam)
-        z_buffer = np.full((height, width), fill_value=np.inf)
-        vis_indices = np.where(visible_mask)[0]
-
-        # Находим наименьшую глубину (ближайшую поверхность) для каждого пикселя
-        for idx in vis_indices:
-            r_y, r_x = py[idx], px[idx]
-            if depths[idx] < z_buffer[r_y, r_x]:
-                z_buffer[r_y, r_x] = depths[idx]
-
-        # Вершина передняя, если её глубина совпадает с минимальной глубиной в пикселе
-        eps = extent * 0.03  # Допуск по глубине
-        is_front_surface = np.abs(depths - z_buffer[py, px]) < eps
-
-        # 4. Sample mask
-        sampled_mask = mask_arr[py, px]
-
-        # Накапливаем совпадения только для передних видимых вершин
-        vertex_hit_count += (visible_mask & is_front_surface & sampled_mask).astype(int)
+        # Orthographic rays have the same direction for every image pixel.
+        origins = face_centers[candidates] + z_cam * (2.0 * extent)
+        directions = np.broadcast_to(-z_cam, origins.shape)
+        rays = np.concatenate((origins, directions), axis=1).astype(np.float32)
+        hits = ray_scene.cast_rays(o3d.core.Tensor(rays))
+        first_faces = hits['primitive_ids'].numpy()
+        visible_faces = candidates[first_faces == candidates]
+        face_visible_count[visible_faces] += 1
+        face_hit_count[visible_faces] += mask_arr[py[visible_faces], px[visible_faces]]
 
     # Применяем фильтр по количеству ракурсов
-    vertex_masked = vertex_hit_count >= min_views
+    masked_faces = (face_hit_count >= min_views) & (face_hit_count * 2 > face_visible_count)
 
     # --- Color 3D Mesh ---
     colored_mesh = mesh.copy()
-    colors = np.full((len(vertices), 4), [180, 180, 180, 255], dtype=np.uint8)
-    colors[vertex_masked] = [0, 255, 0, 255]
-    colored_mesh.visual.vertex_colors = colors
+    colors = np.full((len(mesh.faces), 4), [180, 180, 180, 255], dtype=np.uint8)
+    colors[masked_faces] = [0, 255, 0, 255]
+    colored_mesh.visual = trimesh.visual.ColorVisuals(mesh=colored_mesh, face_colors=colors)
 
     # --- Extract Mask Submesh ---
-    masked_faces = vertex_masked[mesh.faces].any(axis=1)
     mask_submesh = mesh.submesh([masked_faces], append=True)
 
     return colored_mesh, mask_submesh
