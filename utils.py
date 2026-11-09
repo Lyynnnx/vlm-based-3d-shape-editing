@@ -245,13 +245,11 @@ def generate_bounding_box_for_image(
     model_name="qwen3-vl:8b",
     temperature=0.1,
 ):
-    """Detect a requested part and return a JSON string with PIXEL coordinates.
+    """Locate a part and return JSON with a pixel-space bounding box.
 
-    Output: {"is_found": bool, "bbox_2d": [xmin, ymin, xmax, ymax] | None}.
-    Qwen3-VL returns coordinates normalized to [0, 1000]; Qwen2.5-VL
-    is prompted for absolute pixel coordinates. A missing target returns
-    is_found=False. Invalid model output raises an exception instead of
-    silently being treated as a missing target.
+    A visible target returns {"is_found": true, "bbox_2d": [x1,y1,x2,y2]}.
+    A genuinely absent target returns {"is_found": false, "bbox_2d": null}.
+    Inference/format failures raise RuntimeError or ValueError, never 'not found'.
     """
     import math
 
@@ -262,88 +260,70 @@ def generate_bounding_box_for_image(
     is_qwen3 = "qwen3" in name
     is_qwen25 = "qwen2.5" in name
     if not (is_qwen3 or is_qwen25):
-        raise ValueError(
-            f"Unknown coordinate convention for model {model_name!r}. "
-            "Specify the model's bbox coordinate system before using it."
-        )
+        raise ValueError(f"Unknown coordinate convention for {model_name!r}")
 
-    if is_qwen3:
-        system_prompt = BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT
-    else:
-        # The shared project prompt requests normalized coordinates.
-        # Qwen2.5-VL is instead prompted for absolute image pixels.
-        system_prompt = BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT.replace(
+    system_prompt = BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT
+    if is_qwen25:
+        system_prompt = system_prompt.replace(
             "Coordinates must be integers normalized to [0, 1000],",
-            f"Coordinates must be absolute pixel integers for a {width}x{height} image,"
+            f"Coordinates must be absolute pixel integers for a {width}x{height} image,",
         )
 
     client = ollama.Client(host=ollama_host)
-    response = client.chat(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": str(user_prompt), "images": [str(image_path)]},
-        ],
-        format="json",
-        options={"temperature": temperature},
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": str(user_prompt), "images": [str(image_path)]},
+    ]
 
-    content = response["message"]["content"]
-    if not isinstance(content, str) or not content.strip():
-        raise RuntimeError(
-            f"{model_name} returned an empty response for {image_path!s}; "
-            f"done_reason={response.get('done_reason')!r}"
-        )
+    # Retrying a truncated generation is different from a legitimate 'not found'.
+    #limits = (1024, 4096) if is_qwen3 else (1024, 2048)
+    content = None
+    last_reason = None
+    # for attempt, limit in enumerate(limits, 1):
+    kwargs = {
+        "model": model_name,
+        "messages": messages,
+        "format": "json",
+        "options": {"temperature": temperature},
+    }
+    if is_qwen3:
+        kwargs["think"] = False
+        response = client.chat(**kwargs)
+        content = response["message"]["content"]
+        last_reason = response.get("done_reason")
 
     try:
         result = json.loads(content)
     except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"{model_name} returned invalid JSON for {image_path!s}: {content[:500]!r}"
-        ) from exc
-
+        raise ValueError(f"Invalid JSON from {model_name} for {image_path}: {content[:400]!r}") from exc
     if not isinstance(result, dict) or type(result.get("is_found")) is not bool:
-        raise ValueError(f"Invalid is_found from {model_name}: {result!r}")
-
-    if not result["is_found"]:
+        raise ValueError(f"Invalid detection response: {result!r}")
+    if result["is_found"] is False:
         return json.dumps({"is_found": False, "bbox_2d": None})
 
     bbox = result.get("bbox_2d")
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-        raise ValueError(f"Invalid bbox_2d from {model_name}: {bbox!r}")
-
+        raise ValueError(f"Invalid bbox_2d: {bbox!r}")
+    if any(isinstance(v, bool) for v in bbox):
+        raise ValueError(f"Boolean bbox coordinate: {bbox!r}")
     try:
-        if any(isinstance(v, bool) for v in bbox):
-            raise ValueError("Boolean coordinate")
         coords = [float(v) for v in bbox]
-        if not all(math.isfinite(v) for v in coords):
-            raise ValueError("Non-finite coordinate")
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid bbox coordinates from {model_name}: {bbox!r}") from exc
-
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Non-numeric bbox: {bbox!r}") from exc
+    if not all(math.isfinite(v) for v in coords):
+        raise ValueError(f"Non-finite bbox: {bbox!r}")
     if is_qwen3:
-        # The model reports normalized coordinates, not image pixels.
         if not all(0 <= v <= 1000 for v in coords):
-            raise ValueError(f"Qwen3 bbox outside normalized [0, 1000] range: {bbox!r}")
-        coords = [
-            coords[0] * width / 1000,
-            coords[1] * height / 1000,
-            coords[2] * width / 1000,
-            coords[3] * height / 1000,
-        ]
-
+            raise ValueError(f"Qwen3 coordinates outside [0,1000]: {bbox!r}")
+        coords = [coords[0]*width/1000, coords[1]*height/1000,
+                  coords[2]*width/1000, coords[3]*height/1000]
     x1, y1, x2, y2 = coords
     if x1 >= x2 or y1 >= y2:
-        raise ValueError(f"Inverted or empty bbox from {model_name}: {bbox!r}")
-
-    # Clamp round-off / slightly out-of-frame detections to image dimensions.
-    x1 = max(0, min(width - 1, round(x1)))
-    y1 = max(0, min(height - 1, round(y1)))
-    x2 = max(0, min(width - 1, round(x2)))
-    y2 = max(0, min(height - 1, round(y2)))
+        raise ValueError(f"Inverted bbox: {bbox!r}")
+    x1, y1 = max(0, min(width-1, round(x1))), max(0, min(height-1, round(y1)))
+    x2, y2 = max(0, min(width-1, round(x2))), max(0, min(height-1, round(y2)))
     if x1 >= x2 or y1 >= y2:
-        raise ValueError(f"Bounding box collapsed after pixel conversion: {bbox!r}")
-
+        raise ValueError(f"Collapsed bbox after conversion: {bbox!r}")
     return json.dumps({"is_found": True, "bbox_2d": [x1, y1, x2, y2]})
 
 
