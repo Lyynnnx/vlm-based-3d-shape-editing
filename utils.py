@@ -1,17 +1,17 @@
 import os
-import torch
 from segment_anything import sam_model_registry, SamPredictor
 import torch
 import cv2
-import numpy as np
 import open3d as o3d
-import trimesh
 import matplotlib.pyplot as plt
 from PIL import Image
 import ollama
 from prompts import BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT
 import json
+import trimesh.visual
 
+import numpy as np
+import trimesh
 # =============================================================================
 # 3D to multi-view 2D
 # =============================================================================
@@ -238,37 +238,113 @@ def show_rendered_grid(input_dir="rendered_views", n_views=None, cols=4):
 # ==============================================================================
 # VLM-based bounding box generation
 # ==============================================================================
-def generate_bounding_box_for_image(ollama_host, image_path, user_prompt, model_name = "qwen2.5vl:7b", temperature = 0.1):
+def generate_bounding_box_for_image(
+    ollama_host,
+    image_path,
+    user_prompt,
+    model_name="qwen3-vl:8b",
+    temperature=0.1,
+):
+    """Detect a requested part and return a JSON string with PIXEL coordinates.
+
+    Output: {"is_found": bool, "bbox_2d": [xmin, ymin, xmax, ymax] | None}.
+    Qwen3-VL returns coordinates normalized to [0, 1000]; Qwen2.5-VL
+    is prompted for absolute pixel coordinates. A missing target returns
+    is_found=False. Invalid model output raises an exception instead of
+    silently being treated as a missing target.
     """
-    Generates the upper left and bottom right coordinates of bounding box for requested by user object on given image
-    :param ollama_host: ip address of ollama
-    :param image_path: path to the image. Note: image size should be multiple of 28
-    :param user_prompt: object that should be bounded
-    :param model_name: name of the vlm model, qwen2.5vl:7b by default
-    :param temperature: temperature for vlm predictions
-    :return: array of 4 numbers [x1, y1, x2, y2], where x1, y1 - top left coordinate of bounding box and x2, y2 - bottom right coordinate of bounding box
-    """
+    import math
+
+    with Image.open(image_path) as image:
+        width, height = image.size
+
+    name = model_name.lower()
+    is_qwen3 = "qwen3" in name
+    is_qwen25 = "qwen2.5" in name
+    if not (is_qwen3 or is_qwen25):
+        raise ValueError(
+            f"Unknown coordinate convention for model {model_name!r}. "
+            "Specify the model's bbox coordinate system before using it."
+        )
+
+    if is_qwen3:
+        system_prompt = BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT
+    else:
+        # The shared project prompt requests normalized coordinates.
+        # Qwen2.5-VL is instead prompted for absolute image pixels.
+        system_prompt = BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT.replace(
+            "Coordinates must be integers normalized to [0, 1000],",
+            f"Coordinates must be absolute pixel integers for a {width}x{height} image,"
+        )
+
     client = ollama.Client(host=ollama_host)
-    system_prompt = (BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT)
     response = client.chat(
         model=model_name,
-        messages = [
-            {
-                'role': 'system',
-                'content': system_prompt,
-            },
-            {
-                'role': 'user',
-                'content': f"{user_prompt}",
-                'images': [image_path]
-            }
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": str(user_prompt), "images": [str(image_path)]},
         ],
-        format='json',
-        options={'temperature': temperature}
+        format="json",
+        options={"temperature": temperature},
     )
-    content = response['message']['content']
-    return content
 
+    content = response["message"]["content"]
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError(
+            f"{model_name} returned an empty response for {image_path!s}; "
+            f"done_reason={response.get('done_reason')!r}"
+        )
+
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{model_name} returned invalid JSON for {image_path!s}: {content[:500]!r}"
+        ) from exc
+
+    if not isinstance(result, dict) or type(result.get("is_found")) is not bool:
+        raise ValueError(f"Invalid is_found from {model_name}: {result!r}")
+
+    if not result["is_found"]:
+        return json.dumps({"is_found": False, "bbox_2d": None})
+
+    bbox = result.get("bbox_2d")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        raise ValueError(f"Invalid bbox_2d from {model_name}: {bbox!r}")
+
+    try:
+        if any(isinstance(v, bool) for v in bbox):
+            raise ValueError("Boolean coordinate")
+        coords = [float(v) for v in bbox]
+        if not all(math.isfinite(v) for v in coords):
+            raise ValueError("Non-finite coordinate")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid bbox coordinates from {model_name}: {bbox!r}") from exc
+
+    if is_qwen3:
+        # The model reports normalized coordinates, not image pixels.
+        if not all(0 <= v <= 1000 for v in coords):
+            raise ValueError(f"Qwen3 bbox outside normalized [0, 1000] range: {bbox!r}")
+        coords = [
+            coords[0] * width / 1000,
+            coords[1] * height / 1000,
+            coords[2] * width / 1000,
+            coords[3] * height / 1000,
+        ]
+
+    x1, y1, x2, y2 = coords
+    if x1 >= x2 or y1 >= y2:
+        raise ValueError(f"Inverted or empty bbox from {model_name}: {bbox!r}")
+
+    # Clamp round-off / slightly out-of-frame detections to image dimensions.
+    x1 = max(0, min(width - 1, round(x1)))
+    y1 = max(0, min(height - 1, round(y1)))
+    x2 = max(0, min(width - 1, round(x2)))
+    y2 = max(0, min(height - 1, round(y2)))
+    if x1 >= x2 or y1 >= y2:
+        raise ValueError(f"Bounding box collapsed after pixel conversion: {bbox!r}")
+
+    return json.dumps({"is_found": True, "bbox_2d": [x1, y1, x2, y2]})
 
 
 # ==============================================================================
@@ -369,130 +445,6 @@ def visualize_segmentation(image_path: str, mask, x1, y1, x2, y2):
     plt.title("Output of SAM including bounding box")
     plt.axis('off')
     plt.show()
-
-
-import numpy as np
-from PIL import Image
-import trimesh.visual
-
-import numpy as np
-import trimesh
-from PIL import Image
-
-# def project_masks_to_3d(mesh, masks_data, width=1008, height=1008):
-#     """
-#     Projects 2D masks onto a 3D trimesh model using camera parameters.
-#
-#     Parameters:
-#         mesh: trimesh.Trimesh object
-#         masks_data: list or dict containing mask and camera positions.
-#             Supported formats:
-#             - List of tuples: [(mask, eye), ...] or [(mask, eye, up), ...]
-#             - Dict: {name: (mask, eye), ...} or {name: (mask, eye, up), ...}
-#             - Dict of dicts: {name: {"mask": mask, "eye": eye, "up": up}, ...}
-#         width, height: Resolution of the rendered views (matching mask dimensions)
-#
-#     Returns:
-#         colored_mesh: trimesh.Trimesh with green highlighted masked vertices
-#         mask_submesh: trimesh.Trimesh submesh of the masked region
-#     """
-#     vertices = mesh.vertices
-#     normals = mesh.vertex_normals
-#
-#     # Calculate bounding box parameters natively in Trimesh
-#     bounds = mesh.bounds
-#     center = bounds.mean(axis=0)
-#     extent = mesh.extents.max()
-#
-#     half_size = (extent / 2.0) * 1.2
-#     aspect = width / height
-#
-#     vertex_masked = np.zeros(len(vertices), dtype=bool)
-#     rel_verts = vertices - center
-#
-#     # Unify masks_data into a list of tuples: (mask, eye, up)
-#     items = []
-#     if isinstance(masks_data, dict):
-#         for val in masks_data.values():
-#             if isinstance(val, dict):
-#                 mask = val["mask"]
-#                 eye = np.array(val["eye"], dtype=float)
-#                 up = np.array(val["up"], dtype=float) if "up" in val and val["up"] is not None else None
-#             elif isinstance(val, (tuple, list)):
-#                 mask = val[0]
-#                 eye = np.array(val[1], dtype=float)
-#                 up = np.array(val[2], dtype=float) if len(val) > 2 else None
-#             items.append((mask, eye, up))
-#     elif isinstance(masks_data, (list, tuple)):
-#         for val in masks_data:
-#             if isinstance(val, dict):
-#                 mask = val["mask"]
-#                 eye = np.array(val["eye"], dtype=float)
-#                 up = np.array(val["up"], dtype=float) if "up" in val and val["up"] is not None else None
-#             elif isinstance(val, (tuple, list)):
-#                 mask = val[0]
-#                 eye = np.array(val[1], dtype=float)
-#                 up = np.array(val[2], dtype=float) if len(val) > 2 else None
-#             items.append((mask, eye, up))
-#
-#     for mask_img, eye, up in items:
-#         # Convert mask to boolean numpy array
-#         if isinstance(mask_img, Image.Image):
-#             mask_arr = np.array(mask_img) > 128
-#         else:
-#             mask_arr = mask_img > 0
-#
-#         # Camera orientation basis
-#         z_cam = (eye - center) / np.linalg.norm(eye - center)
-#
-#         # Auto-detect 'up' vector if missing
-#         if up is None:
-#             if np.abs(z_cam[1]) > 0.99:  # Top or Bottom view
-#                 up = np.array([0.0, 0.0, -1.0]) if z_cam[1] > 0 else np.array([0.0, 0.0, 1.0])
-#             else:
-#                 up = np.array([0.0, 1.0, 0.0])
-#
-#         x_cam = np.cross(up, z_cam)
-#         x_cam /= np.linalg.norm(x_cam)
-#         y_cam = np.cross(z_cam, x_cam)
-#         y_cam /= np.linalg.norm(y_cam)
-#
-#         # 1. Back-face culling
-#         visible_mask = np.dot(normals, z_cam) > 0.1
-#
-#         # 2. Project 3D coordinates to NDC
-#         x_proj = np.dot(rel_verts, x_cam)
-#         y_proj = np.dot(rel_verts, y_cam)
-#
-#         u_ndc = x_proj / (half_size * aspect)
-#         v_ndc = y_proj / half_size
-#
-#         # Convert NDC to pixel indices
-#         px = np.clip(np.round((u_ndc + 1.0) / 2.0 * (width - 1)).astype(int), 0, width - 1)
-#         py = np.clip(np.round((1.0 - v_ndc) / 2.0 * (height - 1)).astype(int), 0, height - 1)
-#
-#         # 3. Sample mask
-#         sampled_mask = mask_arr[py, px]
-#
-#         # Accumulate mask flags
-#         vertex_masked |= (visible_mask & sampled_mask)
-#
-#     # --- Color 3D Mesh ---
-#     colored_mesh = mesh.copy()
-#     colors = np.full((len(vertices), 4), [180, 180, 180, 255], dtype=np.uint8)
-#     colors[vertex_masked] = [0, 255, 0, 255]
-#     colored_mesh.visual.vertex_colors = colors
-#
-#     # --- Extract Mask Submesh ---
-#     masked_faces = vertex_masked[mesh.faces].any(axis=1)
-#     mask_submesh = mesh.submesh([masked_faces], append=True)
-#
-#     return colored_mesh, mask_submesh
-
-
-import numpy as np
-import trimesh
-from PIL import Image
 
 def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, normal_thresh=0.3):
     """
