@@ -53,11 +53,7 @@ def _remove_platform_only(tmesh):
     return tmesh
 
 def _convert_trimesh_to_o3d(tmesh):
-    """
-    Convert Trimesh to Open3D TriangleMesh by preserving the colors
-    :param tmesh: trimesh mesh
-    :return: o3d mesh
-    """
+    """Convert Trimesh to Open3D TriangleMesh by preserving the colors"""
 
     tmesh = _remove_platform_only(tmesh)
 
@@ -79,16 +75,18 @@ def _convert_trimesh_to_o3d(tmesh):
     return o3d_mesh
 
 
-def render_6_views(mesh_input, output_dir="rendered_views", width=1008, height=1008, views=None):
+def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=1008, height=1008, views=None):
     """
-    Generates images for specified viewpoints and returns a list of tuples formatted as [(eye_pos, file_path), ...].
+    Generates N images evenly distributed on a sphere around the mesh.
+    Returns a list of tuples formatted as [(eye_pos, file_path), ...].
 
     Parameters:
         - mesh_input: file path (.obj), trimesh.Trimesh, trimesh.Scene, or o3d.geometry.TriangleMesh
+        - n_views: number of viewpoints to generate if views is None
         - output_dir: directory to save rendered frames
         - width, height: resolution of output images
         - views: dict of viewpoints formatted as {"name": (eye_np_array, up_np_array)}.
-                 If None, standard 6 views will be calculated automatically.
+                 If None, n_views camera positions will be calculated using Fibonacci Sphere algorithm.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -96,10 +94,10 @@ def render_6_views(mesh_input, output_dir="rendered_views", width=1008, height=1
     if isinstance(mesh_input, str):
         mesh = o3d.io.read_triangle_mesh(mesh_input)
     elif isinstance(mesh_input, trimesh.Trimesh):
-        mesh = convert_trimesh_to_o3d(mesh_input)
+        mesh = _convert_trimesh_to_o3d(mesh_input)
     elif isinstance(mesh_input, trimesh.Scene):
         tmesh = mesh_input.dump(concatenate=True)
-        mesh = convert_trimesh_to_o3d(tmesh)
+        mesh = _convert_trimesh_to_o3d(tmesh)
     else:
         mesh = mesh_input
 
@@ -111,16 +109,31 @@ def render_6_views(mesh_input, output_dir="rendered_views", width=1008, height=1
     extent = bbox.get_max_extent()
     dist = extent * 2.2  # Camera offset distance
 
-    # Generate standard 6 viewpoints if custom views are not provided
+    # Generate N evenly spaced camera views using Fibonacci Sphere algorithm
     if views is None:
-        views = {
-            "front": (center + np.array([0, 0, dist]), np.array([0, 1, 0])),
-            "back": (center + np.array([0, 0, -dist]), np.array([0, 1, 0])),
-            "left": (center + np.array([-dist, 0, 0]), np.array([0, 1, 0])),
-            "right": (center + np.array([dist, 0, 0]), np.array([0, 1, 0])),
-            "top": (center + np.array([0, dist, 0]), np.array([0, 0, -1])),
-            "bottom": (center + np.array([0, -dist, 0]), np.array([0, 0, 1]))
-        }
+        views = {}
+        phi = np.pi * (3.0 - np.sqrt(5.0))  # Golden angle in radians
+
+        for i in range(n_views):
+            # Calculate y-coordinate along the sphere axis from 1 to -1
+            y = 1.0 - (i / float(n_views - 1)) * 2.0 if n_views > 1 else 0.0
+            radius = np.sqrt(1.0 - y * y)  # Radius at height y
+            theta = phi * i  # Golden angle increment
+
+            # Calculate direction on sphere
+            x = np.cos(theta) * radius
+            z = np.sin(theta) * radius
+
+            direction = np.array([x, y, z])
+            eye = center + direction * dist
+
+            # Set correct up-vector (avoid singular vector alignment near poles)
+            if np.abs(y) > 0.99:
+                up = np.array([0.0, 0.0, -1.0]) if y > 0 else np.array([0.0, 0.0, 1.0])
+            else:
+                up = np.array([0.0, 1.0, 0.0])
+
+            views[f"view_{i + 1:03d}"] = (eye, up)
 
     # Setup Open3D offscreen renderer
     renderer = o3d.visualization.rendering.OffscreenRenderer(width, height)
@@ -159,23 +172,65 @@ def render_6_views(mesh_input, output_dir="rendered_views", width=1008, height=1
 
     return rendered_results
 
-def show_rendered_grid(input_dir="rendered_views"):
-    """
-    Shows a grid of 6 rendered views for given path
-    :param input_dir: directory where multiviews are stored
-    :return:
-    """
-    views = ["front", "back", "left", "right", "top", "bottom"]
-    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
-    axes = axes.flatten()
 
-    for i, view in enumerate(views):
-        path = os.path.join(input_dir, f"{view}.png")
-        if os.path.exists(path):
-            img = Image.open(path)
-            axes[i].imshow(img)
-            axes[i].set_title(view.capitalize(), fontsize=12)
+import os
+import math
+import matplotlib.pyplot as plt
+from PIL import Image
+
+
+def show_rendered_grid(input_dir="rendered_views", n_views=None, cols=4):
+    """
+    Displays a grid of N rendered view images.
+
+    Parameters:
+        - input_dir: Directory where rendered view images are stored
+        - n_views: Maximum number of images to display (if None, displays all found images)
+        - cols: Number of columns in the grid layout (default is 4)
+    """
+    if not os.path.exists(input_dir):
+        print(f"Directory {input_dir} does not exist.")
+        return
+
+    # Collect and sort all image files in the input directory
+    image_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+
+    if not image_files:
+        print(f"No rendered images found in directory {input_dir}.")
+        return
+
+    # Limit the number of images if n_views is specified
+    if n_views is not None:
+        image_files = image_files[:n_views]
+
+    total_views = len(image_files)
+
+    # Automatically calculate rows and columns count
+    cols = min(total_views, cols)
+    rows = math.ceil(total_views / cols)
+
+    # Create Matplotlib figure with dynamic size based on grid dimensions
+    fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows))
+
+    # Flatten axes array to ensure consistent 1D indexing
+    if total_views == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+
+    # Draw each rendered image onto the grid
+    for i, file_name in enumerate(image_files):
+        path = os.path.join(input_dir, file_name)
+        img = Image.open(path)
+
+        axes[i].imshow(img)
+        title = os.path.splitext(file_name)[0].replace('_', ' ').capitalize()
+        axes[i].set_title(title, fontsize=10)
         axes[i].axis('off')
+
+    # Turn off remaining empty subplots if total_views is not divisible by cols
+    for j in range(total_views, len(axes)):
+        axes[j].axis('off')
 
     plt.tight_layout()
     plt.show()
@@ -324,18 +379,131 @@ import numpy as np
 import trimesh
 from PIL import Image
 
-def project_masks_to_3d(mesh, masks_data, width=1008, height=1008):
+# def project_masks_to_3d(mesh, masks_data, width=1008, height=1008):
+#     """
+#     Projects 2D masks onto a 3D trimesh model using camera parameters.
+#
+#     Parameters:
+#         mesh: trimesh.Trimesh object
+#         masks_data: list or dict containing mask and camera positions.
+#             Supported formats:
+#             - List of tuples: [(mask, eye), ...] or [(mask, eye, up), ...]
+#             - Dict: {name: (mask, eye), ...} or {name: (mask, eye, up), ...}
+#             - Dict of dicts: {name: {"mask": mask, "eye": eye, "up": up}, ...}
+#         width, height: Resolution of the rendered views (matching mask dimensions)
+#
+#     Returns:
+#         colored_mesh: trimesh.Trimesh with green highlighted masked vertices
+#         mask_submesh: trimesh.Trimesh submesh of the masked region
+#     """
+#     vertices = mesh.vertices
+#     normals = mesh.vertex_normals
+#
+#     # Calculate bounding box parameters natively in Trimesh
+#     bounds = mesh.bounds
+#     center = bounds.mean(axis=0)
+#     extent = mesh.extents.max()
+#
+#     half_size = (extent / 2.0) * 1.2
+#     aspect = width / height
+#
+#     vertex_masked = np.zeros(len(vertices), dtype=bool)
+#     rel_verts = vertices - center
+#
+#     # Unify masks_data into a list of tuples: (mask, eye, up)
+#     items = []
+#     if isinstance(masks_data, dict):
+#         for val in masks_data.values():
+#             if isinstance(val, dict):
+#                 mask = val["mask"]
+#                 eye = np.array(val["eye"], dtype=float)
+#                 up = np.array(val["up"], dtype=float) if "up" in val and val["up"] is not None else None
+#             elif isinstance(val, (tuple, list)):
+#                 mask = val[0]
+#                 eye = np.array(val[1], dtype=float)
+#                 up = np.array(val[2], dtype=float) if len(val) > 2 else None
+#             items.append((mask, eye, up))
+#     elif isinstance(masks_data, (list, tuple)):
+#         for val in masks_data:
+#             if isinstance(val, dict):
+#                 mask = val["mask"]
+#                 eye = np.array(val["eye"], dtype=float)
+#                 up = np.array(val["up"], dtype=float) if "up" in val and val["up"] is not None else None
+#             elif isinstance(val, (tuple, list)):
+#                 mask = val[0]
+#                 eye = np.array(val[1], dtype=float)
+#                 up = np.array(val[2], dtype=float) if len(val) > 2 else None
+#             items.append((mask, eye, up))
+#
+#     for mask_img, eye, up in items:
+#         # Convert mask to boolean numpy array
+#         if isinstance(mask_img, Image.Image):
+#             mask_arr = np.array(mask_img) > 128
+#         else:
+#             mask_arr = mask_img > 0
+#
+#         # Camera orientation basis
+#         z_cam = (eye - center) / np.linalg.norm(eye - center)
+#
+#         # Auto-detect 'up' vector if missing
+#         if up is None:
+#             if np.abs(z_cam[1]) > 0.99:  # Top or Bottom view
+#                 up = np.array([0.0, 0.0, -1.0]) if z_cam[1] > 0 else np.array([0.0, 0.0, 1.0])
+#             else:
+#                 up = np.array([0.0, 1.0, 0.0])
+#
+#         x_cam = np.cross(up, z_cam)
+#         x_cam /= np.linalg.norm(x_cam)
+#         y_cam = np.cross(z_cam, x_cam)
+#         y_cam /= np.linalg.norm(y_cam)
+#
+#         # 1. Back-face culling
+#         visible_mask = np.dot(normals, z_cam) > 0.1
+#
+#         # 2. Project 3D coordinates to NDC
+#         x_proj = np.dot(rel_verts, x_cam)
+#         y_proj = np.dot(rel_verts, y_cam)
+#
+#         u_ndc = x_proj / (half_size * aspect)
+#         v_ndc = y_proj / half_size
+#
+#         # Convert NDC to pixel indices
+#         px = np.clip(np.round((u_ndc + 1.0) / 2.0 * (width - 1)).astype(int), 0, width - 1)
+#         py = np.clip(np.round((1.0 - v_ndc) / 2.0 * (height - 1)).astype(int), 0, height - 1)
+#
+#         # 3. Sample mask
+#         sampled_mask = mask_arr[py, px]
+#
+#         # Accumulate mask flags
+#         vertex_masked |= (visible_mask & sampled_mask)
+#
+#     # --- Color 3D Mesh ---
+#     colored_mesh = mesh.copy()
+#     colors = np.full((len(vertices), 4), [180, 180, 180, 255], dtype=np.uint8)
+#     colors[vertex_masked] = [0, 255, 0, 255]
+#     colored_mesh.visual.vertex_colors = colors
+#
+#     # --- Extract Mask Submesh ---
+#     masked_faces = vertex_masked[mesh.faces].any(axis=1)
+#     mask_submesh = mesh.submesh([masked_faces], append=True)
+#
+#     return colored_mesh, mask_submesh
+
+
+import numpy as np
+import trimesh
+from PIL import Image
+
+def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, normal_thresh=0.3):
     """
-    Projects 2D masks onto a 3D trimesh model using camera parameters.
+    Projects 2D masks onto a 3D trimesh model using camera parameters with Z-Buffer depth testing.
 
     Parameters:
         mesh: trimesh.Trimesh object
         masks_data: list or dict containing mask and camera positions.
-            Supported formats:
-            - List of tuples: [(mask, eye), ...] or [(mask, eye, up), ...]
-            - Dict: {name: (mask, eye), ...} or {name: (mask, eye, up), ...}
-            - Dict of dicts: {name: {"mask": mask, "eye": eye, "up": up}, ...}
-        width, height: Resolution of the rendered views (matching mask dimensions)
+        width, height: Resolution of the rendered views
+        min_views: Minimum view hits required to mark vertex (set to 2 for strict voting)
+        normal_thresh: Threshold for back-face culling (0.3 eliminates tangential angles)
 
     Returns:
         colored_mesh: trimesh.Trimesh with green highlighted masked vertices
@@ -344,7 +512,6 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008):
     vertices = mesh.vertices
     normals = mesh.vertex_normals
 
-    # Calculate bounding box parameters natively in Trimesh
     bounds = mesh.bounds
     center = bounds.mean(axis=0)
     extent = mesh.extents.max()
@@ -352,7 +519,7 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008):
     half_size = (extent / 2.0) * 1.2
     aspect = width / height
 
-    vertex_masked = np.zeros(len(vertices), dtype=bool)
+    vertex_hit_count = np.zeros(len(vertices), dtype=int)
     rel_verts = vertices - center
 
     # Unify masks_data into a list of tuples: (mask, eye, up)
@@ -402,25 +569,42 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008):
         y_cam = np.cross(z_cam, x_cam)
         y_cam /= np.linalg.norm(y_cam)
 
-        # 1. Back-face culling
-        visible_mask = np.dot(normals, z_cam) > 0.1
+        # 1. Back-face culling (усилен с 0.1 до 0.3)
+        visible_mask = np.dot(normals, z_cam) > normal_thresh
 
-        # 2. Project 3D coordinates to NDC
+        # 2. Project 3D coordinates to NDC & pixels
         x_proj = np.dot(rel_verts, x_cam)
         y_proj = np.dot(rel_verts, y_cam)
 
         u_ndc = x_proj / (half_size * aspect)
         v_ndc = y_proj / half_size
 
-        # Convert NDC to pixel indices
         px = np.clip(np.round((u_ndc + 1.0) / 2.0 * (width - 1)).astype(int), 0, width - 1)
         py = np.clip(np.round((1.0 - v_ndc) / 2.0 * (height - 1)).astype(int), 0, height - 1)
 
-        # 3. Sample mask
+        # 3. Z-Buffer Occlusion Check (ПРОВЕРКА НА ПЕРЕКРЫТИЕ ГЛУБИНЫ)
+        depths = np.dot(rel_verts, z_cam)
+        z_buffer = np.full((height, width), fill_value=np.inf)
+        vis_indices = np.where(visible_mask)[0]
+
+        # Находим наименьшую глубину (ближайшую поверхность) для каждого пикселя
+        for idx in vis_indices:
+            r_y, r_x = py[idx], px[idx]
+            if depths[idx] < z_buffer[r_y, r_x]:
+                z_buffer[r_y, r_x] = depths[idx]
+
+        # Вершина передняя, если её глубина совпадает с минимальной глубиной в пикселе
+        eps = extent * 0.03  # Допуск по глубине
+        is_front_surface = np.abs(depths - z_buffer[py, px]) < eps
+
+        # 4. Sample mask
         sampled_mask = mask_arr[py, px]
 
-        # Accumulate mask flags
-        vertex_masked |= (visible_mask & sampled_mask)
+        # Накапливаем совпадения только для передних видимых вершин
+        vertex_hit_count += (visible_mask & is_front_surface & sampled_mask).astype(int)
+
+    # Применяем фильтр по количеству ракурсов
+    vertex_masked = vertex_hit_count >= min_views
 
     # --- Color 3D Mesh ---
     colored_mesh = mesh.copy()
