@@ -16,6 +16,7 @@ import trimesh
 # 3D to multi-view 2D
 # =============================================================================
 #TODO: Clean the code
+#TODO: В generate_bounding_box_for_image сейчас слишком много проверок. Убрать лишние и сделать код более читаемым
 def _remove_platform_only(tmesh):
     """
     Remove small platforms for some objaverse models
@@ -540,7 +541,7 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, 
         face_hit_count[visible_faces] += mask_arr[py[visible_faces], px[visible_faces]]
 
     # Применяем фильтр по количеству ракурсов
-    masked_faces = (face_hit_count >= min_views) & (face_hit_count * 2 > face_visible_count)
+    masked_faces = (face_hit_count >= min_views)
 
     # --- Color 3D Mesh ---
     colored_mesh = mesh.copy()
