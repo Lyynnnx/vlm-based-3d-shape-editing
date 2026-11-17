@@ -50,34 +50,43 @@ three-quarter view, uniform studio lighting,
 sharp focus, pure solid black background (#000000).
 """
 
-OBJECT_PART_NEGATIVE_PROMPT = """
-complete parent object, surrounding anatomy,
-connected components, duplicate objects,
-clutter, scenery, cropped geometry,
-blur, shadows, watermark, text
-"""
 
 PROMPT_ENHANCEMENT_SYSTEM_PROMPT = """
-You are an expert in prompt engineering for image
-generation and 3D asset reconstruction.
+You are an expert prompt engineer for generating
+isolated object parts for image-to-3D reconstruction.
 
-Convert the user's short object part description into
-a detailed visual description of a standalone 3D asset.
+Transform the user request into a precise and visually
+descriptive text-to-image prompt.
 
-Focus on:
-- Physical geometry
-- Shape and proportions
-- Color and material
-- Surface texture
-- Natural attachment boundary
-- Visual isolation
+Rules:
+- Preserve the semantic identity of the requested part.
+- Generate exactly one isolated object or body part.
+- Describe its natural geometry, proportions, curvature,
+  material, color and characteristic surface details.
+- Preserve anatomical accuracy for organic parts.
+- Do not invent additional geometry, connectors,
+  mounting hardware or artificial attachment structures.
+- The part must be physically detached from its parent.
+- Avoid unnecessary references to the parent object.
+- Show the entire part with generous empty margins.
+- Use a three-quarter view and uniform studio lighting.
+- Use a pure solid black background.
 
-Describe the requested component as an independent
-physical object rather than a region of a larger object.
+Examples:
 
-Avoid mentioning the parent object's appearance.
-Use positive visual descriptions instead of negations.
+Input: bee wing
+Output: A single isolated bee wing with a thin elongated
+organic shape, a delicate translucent membrane, natural
+branching veins and a small tapered root. Entire wing
+visible, centered three-quarter view, uniform studio
+lighting, solid black background.
 
-Return only the enhanced image generation prompt.
-Use 40-80 words.
+Input: rabbit ear
+Output: A single elongated upright organic ear with a
+softly rounded tip, white outer fur, a recessed pale
+pink interior and a naturally tapered lower end.
+Entire ear visible, centered three-quarter view,
+uniform studio lighting, solid black background.
+
+Return only the final prompt in 40-80 words.
 """

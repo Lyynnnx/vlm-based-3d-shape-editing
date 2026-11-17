@@ -8,7 +8,7 @@ import torch
 import cv2
 import open3d as o3d
 import ollama
-from prompts import BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT, OBJECT_PART_GENERATION_PROMPT, OBJECT_PART_NEGATIVE_PROMPT
+from prompts import BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT, PROMPT_ENHANCEMENT_SYSTEM_PROMPT
 import json
 import trimesh.visual
 import os
@@ -636,33 +636,86 @@ def _download_file(file_info, output_path="generated.png"):
     output_path.write_bytes(r.content)
     return output_path
 
-def generate_image_from_text(prompt):
+def _enhance_prompt(prompt, ollama_host):
     """
-    Generates image from comfy UI for given text prompt and displays it
+    Enhances simple prompt to fit the image generation model
+    :param prompt: input prompt
+    :param ollama_host: ollama host
+    :return: enhanced prompt
+    """
+    client = ollama.Client(host=ollama_host)
+
+    response = client.chat(
+        model="qwen3-vl:8b-instruct",
+        messages=[
+            {
+                "role": "system",
+                "content": PROMPT_ENHANCEMENT_SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        think=False,
+        options={"temperature": 0.2}
+    )
+    print(response.model_dump_json(indent=2))
+
+    return response["message"]["content"]
+
+def generate_image_from_text(prompt, ollama_host= "192.168.178.23"):
+    """
+    Generates image from ComfyUI for given text prompt and displays it.
     :param prompt: text describing the image that should be generated
     :return: path to generated image
     """
-    # set the positive and negative prints for image generator
-    with open("../comfyUI_workflows/image_flux2_text_to_image_9b.json") as f:
+    enhanced_prompt = _enhance_prompt(prompt, ollama_host)
+    print(f"enhanced prompt: {enhanced_prompt}")
+    with open("../comfyUI_workflows/image_flux2_large_text_to_image.json") as f:
         workflow = json.load(f)
-        workflow["75:74"]["inputs"]["text"] = OBJECT_PART_GENERATION_PROMPT.format(part=prompt)
-        workflow["75:67"]["inputs"]["text"] = OBJECT_PART_NEGATIVE_PROMPT
-        workflow["75:73"]["inputs"]["noise_seed"] = random.randint(0, 2**32 - 1) # for random
-        workflow["75:62"]["inputs"]["steps"] = 50
-        workflow["75:63"]["inputs"]["cfg"] = 4.0
+
+        # Positive prompt
+        workflow["98:6"]["inputs"]["text"] = enhanced_prompt
+
+        # Random seed
+        workflow["98:25"]["inputs"]["noise_seed"] = random.randint(0, 2**32 - 1)
+
+        # Disable turbo for better quality
+        workflow["98:104"]["inputs"]["value"] = False
+
+        # Normal steps (used when turbo=False)
+        workflow["98:100"]["inputs"]["value"] = 28
+
+        # Guidance
+        workflow["98:26"]["inputs"]["guidance"] = 4.0
+
+        # Resolution
+        workflow["98:47"]["inputs"]["width"] = 1024
+        workflow["98:47"]["inputs"]["height"] = 1024
+        workflow["98:48"]["inputs"]["width"] = 1024
+        workflow["98:48"]["inputs"]["height"] = 1024
+
     response = requests.post(
-    f"{COMFY_URL}/prompt",
-    json={"prompt": workflow}
+        f"{COMFY_URL}/prompt",
+        json={"prompt": workflow}
     )
 
     response.raise_for_status()
     prompt_id = response.json()["prompt_id"]
+
     # collect the generated image
     history_item = _wait_for_completion(prompt_id)
+
     # extract image metadata
     image_info = _extract_image_info(history_item, save_node_id="9")
+
     # download image
-    image_path = _download_file(image_info, output_path=f"../generated_images/{image_info['filename']}")
+    image_path = _download_file(
+        image_info,
+        output_path=f"../generated_images/{image_info['filename']}"
+    )
+
     display(Image(filename=str(image_path)))
     return image_path
 
