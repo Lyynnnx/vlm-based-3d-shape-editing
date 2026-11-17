@@ -1,14 +1,22 @@
-import os
+import random
+import time
+from pathlib import Path
+
+import requests
 from segment_anything import sam_model_registry, SamPredictor
 import torch
 import cv2
 import open3d as o3d
-import matplotlib.pyplot as plt
-from PIL import Image
 import ollama
-from prompts import BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT
+from prompts import BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT, OBJECT_PART_GENERATION_PROMPT, OBJECT_PART_NEGATIVE_PROMPT
 import json
 import trimesh.visual
+import os
+import math
+import matplotlib.pyplot as plt
+from PIL import Image
+from IPython.display import Image, display
+
 
 import numpy as np
 import trimesh
@@ -76,7 +84,7 @@ def _convert_trimesh_to_o3d(tmesh):
     return o3d_mesh
 
 
-def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=1008, height=1008, views=None):
+def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=1008, height=1008, views=None, frame_scale=1.2):
     """
     Generates N images evenly distributed on a sphere around the mesh.
     Returns a list of tuples formatted as [(eye_pos, file_path), ...].
@@ -88,6 +96,7 @@ def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=100
         - width, height: resolution of output images
         - views: dict of viewpoints formatted as {"name": (eye_np_array, up_np_array)}.
                  If None, n_views camera positions will be calculated using Fibonacci Sphere algorithm.
+        - frame_scale: How far the camera is from object
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -144,7 +153,7 @@ def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=100
     renderer.scene.add_geometry("mesh", mesh, material)
     renderer.scene.set_background(np.array([0.2, 0.2, 0.2, 1.0]))
 
-    half_size = (extent / 2.0) * 1.2
+    half_size = (extent / 2.0) * frame_scale
     aspect = width / height
 
     rendered_results = []
@@ -172,12 +181,6 @@ def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=100
     del renderer  # Free resources
 
     return rendered_results
-
-
-import os
-import math
-import matplotlib.pyplot as plt
-from PIL import Image
 
 
 def show_rendered_grid(input_dir="rendered_views", n_views=None, cols=4):
@@ -252,7 +255,6 @@ def generate_bounding_box_for_image(
     A genuinely absent target returns {"is_found": false, "bbox_2d": null}.
     Inference/format failures raise RuntimeError or ValueError, never 'not found'.
     """
-    import math
 
     with Image.open(image_path) as image:
         width, height = image.size
@@ -427,7 +429,11 @@ def visualize_segmentation(image_path: str, mask, x1, y1, x2, y2):
     plt.axis('off')
     plt.show()
 
-def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, normal_thresh=0.3):
+# ==============================================================================
+# Segmentation Masks to 3D Mesh
+# ==============================================================================
+
+def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, normal_thresh=0.3, frame_scale = 1.2):
     """
     Projects 2D masks onto a 3D trimesh model using camera parameters with Z-Buffer depth testing.
 
@@ -437,6 +443,7 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, 
         width, height: Resolution of the rendered views
         min_views: Minimum view hits required to mark vertex (set to 2 for strict voting)
         normal_thresh: Threshold for back-face culling (0.3 eliminates tangential angles)
+        frame_scale: How far the camera is from object
 
     Returns:
         colored_mesh: trimesh.Trimesh with green highlighted masked vertices
@@ -451,7 +458,7 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, 
     center = bounds.mean(axis=0)
     extent = mesh.extents.max()
 
-    half_size = (extent / 2.0) * 1.2
+    half_size = (extent / 2.0) * frame_scale
     aspect = width / height
 
     face_hit_count = np.zeros(len(mesh.faces), dtype=int)
@@ -553,3 +560,150 @@ def project_masks_to_3d(mesh, masks_data, width=1008, height=1008, min_views=1, 
     mask_submesh = mesh.submesh([masked_faces], append=True)
 
     return colored_mesh, mask_submesh
+
+# ==============================================================================
+# 3d Object Generation From Text
+# ==============================================================================
+COMFY_URL = "http://192.168.178.23:8188"
+
+def _wait_for_completion(prompt_id, timeout=1000, poll_interval=1.0):
+    """
+    Performs busy waiting to extract file from queue when ComfyUI is done with a task
+    :param prompt_id: id of image in queue
+    :param timeout: time to wait for completion
+    :param poll_interval: time between requests
+    :return: the extracted file
+    """
+    start = time.time()
+
+    while time.time() - start < timeout:
+        r = requests.get(f"{COMFY_URL}/history/{prompt_id}")
+        r.raise_for_status()
+        history = r.json()
+
+        # When image is generated, it appears in queue
+        if prompt_id in history:
+            item = history[prompt_id]
+
+            status = item.get("status", {})
+            if status.get("status_str") == "error":
+                raise RuntimeError(f"ComfyUI error: {status}")
+
+            return item
+
+        time.sleep(poll_interval)
+
+    raise TimeoutError(f"Prompt {prompt_id} did not finish in {timeout} seconds")
+
+
+def _extract_image_info(history_item, save_node_id="9"):
+    """
+    Extracts information from the file to download it in future
+    save_node_id = ID of SaveImage node in comfy config.
+    9 for text_to_image workflow
+    """
+    outputs = history_item.get("outputs", {})
+    if save_node_id not in outputs:
+        raise KeyError(f"Node {save_node_id} not found in outputs: {list(outputs.keys())}")
+
+    node_output = outputs[save_node_id]
+    images = node_output.get("images", [])
+
+    if not images:
+        raise ValueError("No images returned by SaveImage node")
+
+    return images[0]  # take first image
+
+
+def _download_file(file_info, output_path="generated.png"):
+    """
+    Downloads the file by given file info
+    image_info looks like that:
+    {
+        'filename': 'Flux2-Klein_00001_.png',
+        'subfolder': '',
+        'type': 'output'
+    }
+    :param file_info: information of the file that should be downloaded
+    :param output_path: path where the file should be downloaded
+    :return: the path to the downloaded file
+    """
+    r = requests.get(f"{COMFY_URL}/view", params=file_info)
+    r.raise_for_status()
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(r.content)
+    return output_path
+
+def generate_image_from_text(prompt):
+    """
+    Generates image from comfy UI for given text prompt and displays it
+    :param prompt: text describing the image that should be generated
+    :return: path to generated image
+    """
+    # set the positive and negative prints for image generator
+    with open("../comfyUI_workflows/image_flux2_text_to_image_9b.json") as f:
+        workflow = json.load(f)
+        workflow["75:74"]["inputs"]["text"] = OBJECT_PART_GENERATION_PROMPT.format(part=prompt)
+        workflow["75:67"]["inputs"]["text"] = OBJECT_PART_NEGATIVE_PROMPT
+        workflow["75:73"]["inputs"]["noise_seed"] = random.randint(0, 2**32 - 1) # for random
+        workflow["75:62"]["inputs"]["steps"] = 50
+        workflow["75:63"]["inputs"]["cfg"] = 4.0
+    response = requests.post(
+    f"{COMFY_URL}/prompt",
+    json={"prompt": workflow}
+    )
+
+    response.raise_for_status()
+    prompt_id = response.json()["prompt_id"]
+    # collect the generated image
+    history_item = _wait_for_completion(prompt_id)
+    # extract image metadata
+    image_info = _extract_image_info(history_item, save_node_id="9")
+    # download image
+    image_path = _download_file(image_info, output_path=f"../generated_images/{image_info['filename']}")
+    display(Image(filename=str(image_path)))
+    return image_path
+
+def _upload_image(image_path):
+    """
+    Uploads the image to the Comfy UI server
+    :param image_path: path to the image
+    :return: response from the server
+    """
+    image_path = Path(image_path)
+    with open(image_path, "rb") as f:
+        response = requests.post(
+            f"{COMFY_URL}/upload/image",
+            files={"image": (image_path.name, f)},
+            data={"type": "input", "overwrite": "false"}
+        )
+    response.raise_for_status()
+    return response.json()
+
+def generate_3d_object_from_image(image_path):
+    """
+    Generates 3d object from image
+    :param image_path: path to image
+    :return: path to generated 3d object
+    """
+    image_info = _upload_image(image_path)
+    with open("../comfyUI_workflows/pixal3d_trellis2_image_to_model.json") as f:
+        workflow = json.load(f)
+    # set the image path in 3d object generation workflow
+    workflow["122"]["inputs"]["image"] = image_info["name"]
+    response = requests.post(
+        f"{COMFY_URL}/prompt",
+        json={"prompt": workflow}
+    )
+    # as in image_from_text, download the file, its metadata and download it
+    response.raise_for_status()
+    prompt_id = response.json()["prompt_id"]
+    history_item = _wait_for_completion(prompt_id)
+    model_info = history_item["outputs"]["322"]["3d"][0]
+    model_path = _download_file(
+        model_info,
+        "../generated_models/" + model_info["filename"]
+    )
+    return model_path
