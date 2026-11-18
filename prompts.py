@@ -1,3 +1,6 @@
+# ==============================================================================
+# Deletion tool
+# ==============================================================================
 BOUNDING_BOX_GENERATOR_SYSTEM_PROMPT = """
 You are a visual grounding model specialized in locating
 specific object parts in images of 3D-rendered objects.
@@ -33,71 +36,69 @@ If not found:
 }
 """
 
-
+# ==============================================================================
+# Insertion tool
+# ==============================================================================
 
 ATTACHMENT_POINT_SYSTEM_PROMPT = """
-Predict a single attachment point on the surface
-of the object shown in the image.
+You are a visual reasoning model for 3D object editing.
 
-Follow the user's description of the desired
-attachment location.
+Image 1 shows the original object.
+The remaining images show the component to attach.
 
-Return integer coordinates normalized to [0, 1000].
+Imagine the component attached to the original object
+according to the user's instructions.
 
-Return only JSON:
-{
-    "is_found": true,
-    "point_2d": [x, y]
-}
+Predict the single point on the original object's
+surface where the new component should connect.
+
+The point represents the center of the contact area
+between the two objects.
+
+Return coordinates relative to Image 1 only.
+Use integer coordinates normalized to [0, 1000].
+
+Return a JSON object with the following fields:
+- is_found: boolean
+- point_2d: [x, y] or null if not found
 """
 
 
-
 INSERTION_BOUNDING_BOX_SYSTEM_PROMPT = """
-You predict the placement of new components on 3D objects.
+You are a visual grounding model for 3D object insertion.
 
-Image 1: original object.
-Remaining images: reference views of the component to insert.
-
-The component does not yet exist in Image 1.
+Input:
+- Image 1 shows the target object.
+- A red marker in Image 1 indicates the exact attachment anchor.
+- Remaining images show reference views of the component to insert.
 
 Your task:
-1. Identify a suitable local attachment area on the original object.
-2. Imagine the new component attached to that area.
-3. Estimate the size and orientation of the inserted component.
-4. Return a bounding box around ONLY the imagined component.
+Predict the 2D bounding box of the imagined inserted component in Image 1.
 
-The attachment portion of the component must slightly
-penetrate the original object's surface.
+Rules:
+1. The new component must be attached at the red marker.
+2. The component should slightly penetrate the surface at the marker.
+3. Return a bounding box around ONLY the imagined inserted component.
+4. Do NOT return a box around the whole target object.
+5. Use the reference images to estimate the inserted component's size, proportions and orientation.
+6. If the anchor is not visible well enough in this view, or the component placement cannot be estimated reliably, return is_found=false.
+7. Coordinates must be integers normalized to [0, 1000], in [xmin, ymin, xmax, ymax] order.
 
-Do not detect the original object.
-Do not return a bounding box around the original object.
-The predicted box may include empty background.
+Return only JSON.
 
-Return coordinates relative to Image 1 only.
-
-Use integer coordinates normalized to [0, 1000].
-
-All spatial directions (left, right, front, back)
-refer to the original object's intrinsic coordinate
-system, not the image coordinate system.
-
-The insertion location must represent the same
-physical location regardless of the camera viewpoint.
-
-Do not confuse the left side of the image with
-the left side of the original object.
-
-If the attachment location is occluded, estimate
-its projected position consistently or return
-is_found=false if it cannot be determined.
-
-Return only JSON:
+If found:
 {
     "is_found": true,
     "bbox_2d": [xmin, ymin, xmax, ymax]
 }
+
+If not found:
+{
+    "is_found": false,
+    "bbox_2d": null
+}
 """
+
 VIEW_SELECTION_SYSTEM_PROMPT = """
 You are a visual assistant for 3D object editing.
 
@@ -119,6 +120,29 @@ Return only JSON:
 """
 
 
+FRONT_VIEW_SELECTION_SYSTEM_PROMPT = """
+You are a visual reasoning model for 3D object editing.
+
+The input image contains numbered views of the
+same 3D object from different camera positions.
+
+Identify the view that most directly shows
+the object's intrinsic front side.
+
+The object may have an arbitrary 3D orientation.
+Do not assume that it is standing upright.
+
+Compare all views and identify characteristic
+features that indicate the object's front.
+
+Return a JSON object with the following fields:
+- reasoning: a brief explanation of your selection.
+- front_view: the integer ID of the selected view.
+"""
+
+# ==============================================================================
+# 3d Object generation
+# ==============================================================================
 OBJECT_PART_GENERATION_PROMPT = """
 A single isolated {part}, presented as a standalone
 3D asset.

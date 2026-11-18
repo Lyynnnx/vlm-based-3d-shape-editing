@@ -2,6 +2,7 @@
 data_cache/
 weights/
 rendered_views/
+rendered_anchor_views/
 rendered_new_object_views/
 generated_images/
 generated_models/
