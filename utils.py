@@ -15,7 +15,7 @@ import os
 import math
 import matplotlib.pyplot as plt
 from PIL import Image
-from IPython.display import Image, display
+from IPython.display import Image as IPyImage, display
 
 
 import numpy as np
@@ -61,10 +61,10 @@ def _remove_platform_only(tmesh):
         return trimesh.util.concatenate(cat_parts)
     return tmesh
 
-def _convert_trimesh_to_o3d(tmesh):
+def _convert_trimesh_to_o3d(tmesh, is_objaverse_model = True):
     """Convert Trimesh to Open3D TriangleMesh by preserving the colors"""
-
-    tmesh = _remove_platform_only(tmesh)
+    if is_objaverse_model:
+        tmesh = _remove_platform_only(tmesh)
 
 
     o3d_mesh = o3d.geometry.TriangleMesh()
@@ -84,7 +84,7 @@ def _convert_trimesh_to_o3d(tmesh):
     return o3d_mesh
 
 
-def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=1008, height=1008, views=None, frame_scale=1.2):
+def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=1008, height=1008, views=None, frame_scale=1.2, is_objaverse_model=True):
     """
     Generates N images evenly distributed on a sphere around the mesh.
     Returns a list of tuples formatted as [(eye_pos, file_path), ...].
@@ -107,7 +107,7 @@ def render_n_views(mesh_input, n_views=6, output_dir="rendered_views", width=100
         mesh = _convert_trimesh_to_o3d(mesh_input)
     elif isinstance(mesh_input, trimesh.Scene):
         tmesh = mesh_input.dump(concatenate=True)
-        mesh = _convert_trimesh_to_o3d(tmesh)
+        mesh = _convert_trimesh_to_o3d(tmesh, is_objaverse_model=is_objaverse_model)
     else:
         mesh = mesh_input
 
@@ -660,7 +660,6 @@ def _enhance_prompt(prompt, ollama_host):
         think=False,
         options={"temperature": 0.2}
     )
-    print(response.model_dump_json(indent=2))
 
     return response["message"]["content"]
 
@@ -671,8 +670,11 @@ def generate_image_from_text(prompt, ollama_host= "192.168.178.23"):
     :return: path to generated image
     """
     enhanced_prompt = _enhance_prompt(prompt, ollama_host)
+    print(f"""
+    GENERATING IMAGE FOR PROMPT:
+    {prompt}""")
     print(f"enhanced prompt: {enhanced_prompt}")
-    with open("../comfyUI_workflows/image_flux2_large_text_to_image.json") as f:
+    with open("comfyUI_workflows/image_flux2_large_text_to_image.json") as f:
         workflow = json.load(f)
 
         # Positive prompt
@@ -716,7 +718,7 @@ def generate_image_from_text(prompt, ollama_host= "192.168.178.23"):
         output_path=f"../generated_images/{image_info['filename']}"
     )
 
-    display(Image(filename=str(image_path)))
+    display(IPyImage(filename=str(image_path)))
     return image_path
 
 def _upload_image(image_path):
@@ -742,7 +744,7 @@ def generate_3d_object_from_image(image_path):
     :return: path to generated 3d object
     """
     image_info = _upload_image(image_path)
-    with open("../comfyUI_workflows/pixal3d_trellis2_image_to_model.json") as f:
+    with open("comfyUI_workflows/pixal3d_trellis2_image_to_model.json") as f:
         workflow = json.load(f)
     # set the image path in 3d object generation workflow
     workflow["122"]["inputs"]["image"] = image_info["name"]

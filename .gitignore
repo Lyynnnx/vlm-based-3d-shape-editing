@@ -2,7 +2,8 @@
 data_cache/
 weights/
 rendered_views/
+rendered_new_object_views/
 generated_images/
 generated_models/
-.DS_Store
 .DS_Store/
+views_grid.png

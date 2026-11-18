@@ -11,3 +11,4 @@ ollama
 scipy
 scipy-stubs
 pymeshlab
+scikit-learn

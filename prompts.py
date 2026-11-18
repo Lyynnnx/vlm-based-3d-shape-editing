@@ -33,6 +33,92 @@ If not found:
 }
 """
 
+
+
+ATTACHMENT_POINT_SYSTEM_PROMPT = """
+Predict a single attachment point on the surface
+of the object shown in the image.
+
+Follow the user's description of the desired
+attachment location.
+
+Return integer coordinates normalized to [0, 1000].
+
+Return only JSON:
+{
+    "is_found": true,
+    "point_2d": [x, y]
+}
+"""
+
+
+
+INSERTION_BOUNDING_BOX_SYSTEM_PROMPT = """
+You predict the placement of new components on 3D objects.
+
+Image 1: original object.
+Remaining images: reference views of the component to insert.
+
+The component does not yet exist in Image 1.
+
+Your task:
+1. Identify a suitable local attachment area on the original object.
+2. Imagine the new component attached to that area.
+3. Estimate the size and orientation of the inserted component.
+4. Return a bounding box around ONLY the imagined component.
+
+The attachment portion of the component must slightly
+penetrate the original object's surface.
+
+Do not detect the original object.
+Do not return a bounding box around the original object.
+The predicted box may include empty background.
+
+Return coordinates relative to Image 1 only.
+
+Use integer coordinates normalized to [0, 1000].
+
+All spatial directions (left, right, front, back)
+refer to the original object's intrinsic coordinate
+system, not the image coordinate system.
+
+The insertion location must represent the same
+physical location regardless of the camera viewpoint.
+
+Do not confuse the left side of the image with
+the left side of the original object.
+
+If the attachment location is occluded, estimate
+its projected position consistently or return
+is_found=false if it cannot be determined.
+
+Return only JSON:
+{
+    "is_found": true,
+    "bbox_2d": [xmin, ymin, xmax, ymax]
+}
+"""
+VIEW_SELECTION_SYSTEM_PROMPT = """
+You are a visual assistant for 3D object editing.
+
+The input image contains numbered views of the
+same 3D object from different camera positions.
+
+Select the views that best show the requested
+attachment area.
+
+Compare the views with each other.
+Respect the object's anatomical orientation.
+
+Select the 3 most informative views.
+
+Return only JSON:
+{
+    "selected_views": [id1, id2, id3]
+}
+"""
+
+
 OBJECT_PART_GENERATION_PROMPT = """
 A single isolated {part}, presented as a standalone
 3D asset.
