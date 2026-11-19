@@ -6,5 +6,6 @@ rendered_anchor_views/
 rendered_new_object_views/
 generated_images/
 generated_models/
+insertion_runs/
 .DS_Store/
 views_grid.png
